@@ -212,6 +212,7 @@ class PerleParser(Section):
 # Lookup table for RANCID models
 parsers = {
     'arista':  CiscoParser,
+    'aruba':   CiscoParser,
     'bigip':   JuniperParser,
     'cisco':   CiscoParser,
     'foundry': CiscoParser,
