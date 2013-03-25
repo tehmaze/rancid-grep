@@ -1,0 +1,378 @@
+#!/usr/bin/env python2
+
+import glob
+import os
+import re
+
+
+DESCRIPTION='''Search trough Rancid configuration dumps.
+
+Multiple vendors are supported, so if one is looking for an interface with IPv4
+address 192.0.2.1 on Cisco devices, invoke `rancid-grep -m cisco interface
+192.0.2.1`. If you are looking for a NAT-rule entry on Juniper for 192.0.2.1,
+invoke `rancid-grep -m juniper 'rule$' 192.0.2.1` Mind you that both the
+section and item filters are perl compatible regular expressions.
+'''
+
+
+class RegExp(object):
+    cache = {}
+
+    def __init__(self, pattern, flags=0):
+        try:
+            self.re = RegExp.cache[(pattern, flags)]
+        except KeyError:
+            self.re = re.compile(pattern, flags)
+            RegExp.cache[(pattern, flags)] = self.re
+
+        print RegExp.cache
+
+    def __contains__(self, text):
+        return bool(self.re.match(text))
+
+
+class Section(object):
+    def __init__(self, name='root', verbose=False):
+        self.name = name
+        self.verbose = verbose
+
+        # Holds the meta information for this node
+        self.children = []
+        self.config = []
+
+    def __str__(self):
+        return self.render()
+
+    def add_child(self, section):
+        self.children.append(section)
+
+    def grep(self, pattern):
+        return str(self) in RegExp(pattern, re.M)
+
+    def scan(self, pattern):
+        if pattern.search(self.name):
+            return [self]
+
+        matches = []
+        for child in self.children:
+            if pattern.search(child.name):
+                matches.append(child)
+            else:
+                matches.extend(child.scan(pattern))
+
+        return matches
+
+
+class CiscoParser(Section):
+    def __init__(self, name='root', verbose=False):
+        super(CiscoParser, self).__init__(name, verbose)
+
+        self.stack = [self]
+        self._config = []
+
+    def parse(self, line):
+        line = line.rstrip()
+
+        if not line:
+            return
+        elif line[0] == '!':  # Comment or end of block
+            self.stack[-1].config.extend(self._config)
+            self._config = []
+
+            # If we descended into a sub section, go back to the root
+            if self.stack[-1] != self:
+                self.stack.pop(-1)
+
+        elif line[0] == ' ':  # Configuration data for sub-section
+            if self._config:  # Previously we had a section
+                name = self._config.pop(0)
+                section = CiscoParser(name)
+                self.add_child(section)
+                self.stack.append(section)
+
+            elif self.stack[-1] != self:
+                self.stack[-1].config.append(line)
+
+            else:
+                print 'unparsable', line
+
+        else:  # Configuration data -or- new section start
+            if self._config:  # Previously we had configuration data
+                self.config.append(self._config.pop(0))
+            self._config.append(line)
+
+    def render(self, level=0):
+        indent = ' ' * level
+        output = []
+        output.append('%s%s' % (indent, self.name))
+        for child in self.children:
+            output.append(child.render(level + 1))
+        for line in self.config:
+            output.append('%s%s' % (indent, line))
+        return '\n'.join(output)
+
+
+class JuniperParser(Section):
+    _re_strip = re.compile(r'([;{}])(?:\s*|\s*#.*)$')
+
+    def __init__(self, name='root', verbose=False):
+        super(JuniperParser, self).__init__(name, verbose)
+
+        # Parser stack
+        self.stack = [self]
+
+    def parse(self, line):
+        line = self._re_strip.sub(r'\1', line).rstrip()
+        text = line.lstrip()
+
+        # Comment
+        if text[0] in '#!' or text.startswith('/*'):
+            return
+
+        # Section start marker
+        elif line.endswith('{'):
+            name = line[:-1].strip()
+            section = JuniperParser(name)
+            self.stack[-1].add_child(section)
+            self.stack.append(section)
+
+        # Section close marker
+        elif line.strip() == '}':
+            self.stack[-1].children.sort(lambda a, b: cmp(a.name, b.name))
+            self.stack.pop(-1)
+
+        # Configuration data
+        elif line.endswith(';'):
+            self.stack[-1].config.append(line.strip())
+
+        # Cluster data, ignore
+        elif line.startswith('{') and line.endswith('}'):
+            pass
+
+        else:
+            if self.verbose:
+                print 'unparsable data %r' % (line,)
+
+    def render(self, level=0):
+        indent = '    ' * level
+        output = []
+        output.append('%s%s {' % (indent, self.name))
+        for child in self.children:
+            output.append(child.render(level + 1))
+        for line in self.config:
+            output.append('%s    %s' % (indent, line))
+        output.append('%s}' % (indent,))
+        return '\n'.join(output)
+
+
+class PerleParser(Section):
+    def __init__(self, name='root', verbose=False):
+        super(PerleParser, self).__init__(name, verbose)
+
+        # Parser stack
+        self.stack = [self]
+
+    def parse(self, line):
+        line = line.strip()
+
+        # Comment
+        if line[0] in ';!':
+            return
+
+        # Section close marker
+        elif line.startswith('[/') and line.endswith(']'):
+            self.stack.pop(-1)
+
+        # Section start marker
+        elif line.startswith('[') and line.endswith(']'):
+            name = line[1:-1]
+            section = PerleParser(name)
+            self.stack[-1].add_child(section)
+            self.stack.append(section)
+
+        # Configuration data
+        elif '=' in line:
+            self.stack[-1].config.append(line)
+
+        else:
+            if self.verbose:
+                print 'unparsable data %r' % (line,)
+
+    def render(self, level=0):
+        indent = '  ' * level
+        output = []
+        output.append('%s[%s]' % (indent, self.name))
+        for child in self.children:
+            output.append(child.render(level + 1))
+        for line in self.config:
+            output.append('%s  %s' % (indent, line))
+        output.append('%s[/%s]' % (indent, self.name))
+        return '\n'.join(output)
+
+# Lookup table for RANCID models
+parsers = {
+    'arista':  CiscoParser,
+    'bigip':   JuniperParser,
+    'cisco':   CiscoParser,
+    'juniper': JuniperParser,
+    'perle':   PerleParser,
+}
+
+
+class Parser(object):
+    def __init__(self, filename, option):
+        self.filename = filename
+        self.option = option
+
+        if self.option.verbose:
+            print 'parsing', filename
+
+        self.first = ''
+        self.parse = None
+        for line in file(filename):
+            if self.first == '':
+                self.first = line.strip()
+                self.parse = self.detect(self.first)
+            else:
+                self.parse.parse(line)
+
+        if self.parse is None:
+            # Empty file? Hmm
+            raise ValueError(None)
+
+    def detect(self, line):
+        '''Detect the RANCID model type.'''
+        if 'RANCID-CONTENT-TYPE:' in line:
+            model = line.split()[-1]
+            if self.option.verbose:
+                print 'detected model', model
+
+            if self.option.models:
+                if model not in self.option.models:
+                    raise ValueError(model)
+            return parsers[model](verbose=self.option.verbose)
+        else:
+            raise TypeError('No RANCID-CONTENT-TYPE marker found in %s' %
+                            self.filename)
+
+    def render(self, level=0):
+        return self.parse.render(level)
+
+    def scan(self, pattern):
+        return self.parse.scan(pattern)
+
+
+def walk(filenames, option):
+    workpath = os.path.abspath(os.getcwd())
+
+    for filename in filenames:
+        if os.path.basename(filename) in option.ignore:
+            continue
+
+        if os.path.isdir(filename):
+            # Oh, you want me to search an entire directory? Ok.
+            for item in walk(glob.glob(os.path.join(filename, '*')), option):
+                yield item
+
+        elif os.path.islink(filename):
+            # Ignore
+            pass
+
+        else:
+            filename = os.path.abspath(filename)
+            if filename.startswith(workpath):
+                filename = filename.replace(workpath, '').lstrip(os.sep)
+            yield filename
+
+
+def _sort_highlight(a, b):
+    if len(a) == len(b):
+        return cmp(a, b)
+    elif len(a) > len(b):
+        return -1
+    else:
+        return 1
+
+
+def highlight(data, items):
+    items = list(items)
+    items.sort(_sort_highlight)
+    for item in items:
+        data = data.replace(item, '\x1b[7m%s\x1b[0m' % item)
+    return data
+
+
+def run():
+    import optparse
+
+    parser = optparse.OptionParser(
+        usage='%prog [<options>] <section filter> [<filter>] [<file(s)>]',
+        description=DESCRIPTION,
+    )
+    parser.add_option('-c', '--color', default=None, action='store_true',
+                      help='use color')
+    parser.add_option('-m', '--models',
+                      default=[],
+                      action='append',
+                      help='models (default: all)')
+    parser.add_option('-i', '--ignore',
+                      default=['.git', '.hg', '.svn', 'CVS', 'router',
+                               'router.db'],
+                      action='append',
+                      help='ignore these files (default: .git .hg .svn '
+                           'CVS router router.db')
+    parser.add_option('-v', '--verbose', default=False, action='store_true',
+                      help='be verbose')
+
+    option, args = parser.parse_args()
+
+    if len(args) >= 3:
+        filenames = args[2:]
+    else:
+        filenames = glob.glob('*')
+
+    if len(args) >= 2:
+        pattern = re.compile('(%s)' % args[1], re.M | re.I)
+    else:
+        pattern = re.compile('.')
+
+    try:
+        matcher = re.compile(args[0], re.I)
+    except IndexError:
+        parser.error('need at least one argument')
+        return 1
+
+    if option.color is None:
+        option.color = sys.stdout.isatty()
+
+    for filename in walk(filenames, option=option):
+        first = True
+        try:
+            parser = Parser(filename, option)
+        except KeyError, e:
+            model = e.args[0]
+            if option.color:
+                print '\x1b[1;31mmodel %s not supported\x1b[0m' % model
+            else:
+                print 'model %s not supported' % model
+            continue
+        except ValueError:
+            continue
+
+        for section in parser.scan(matcher):
+            section = section.render()
+            matches = pattern.search(section)
+            if matches:
+                if first:
+                    first = False
+                    if option.color:
+                        print '\x1b[1;32m%s\x1b[0m' % filename
+                    else:
+                        print filename
+                if option.color:
+                    section = highlight(section, matches.groups())
+                print section
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(run())
