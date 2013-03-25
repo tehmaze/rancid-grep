@@ -73,7 +73,7 @@ class CiscoParser(Section):
     def parse(self, line):
         line = line.rstrip()
 
-        if not line:
+        if not line or line == ' !':
             return
         elif line[0] == '!':  # Comment or end of block
             self.stack[-1].config.extend(self._config)
