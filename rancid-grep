@@ -214,6 +214,7 @@ parsers = {
     'arista':  CiscoParser,
     'bigip':   JuniperParser,
     'cisco':   CiscoParser,
+    'foundry': CiscoParser,
     'juniper': JuniperParser,
     'perle':   PerleParser,
 }
