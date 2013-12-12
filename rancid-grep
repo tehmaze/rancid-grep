@@ -89,6 +89,7 @@ class CiscoParser(Section):
                 section = CiscoParser(name)
                 self.add_child(section)
                 self.stack.append(section)
+                self.stack[-1].config.append(line)
 
             elif self.stack[-1] != self:
                 self.stack[-1].config.append(line)
